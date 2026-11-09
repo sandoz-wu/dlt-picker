@@ -17,47 +17,74 @@ jobs:
       - name: Fetch latest draws
         run: |
           cat > update.mjs <<'EOF'
-          const API = "https://webapi.sporttery.cn/gateway/lottery/getHistoryPageListV1.qry?gameNo=85&provinceId=0&pageSize=30&isVerify=1&pageNo=1";
-          // 2026-11-07 起官方接口 WAF 拦截无浏览器头的请求（实测 HTTP 567），必须带 UA/Referer
-          const HEADERS = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
-            "Accept": "application/json, text/plain, */*",
-            "Referer": "https://static.sporttery.cn/",
-            "Origin": "https://static.sporttery.cn",
-          };
-          let list = [], lastErr = null;
-          for (let a = 1; a <= 3; a++) {
-            try {
-              const r = await fetch(API, { headers: HEADERS });
-              if (!r.ok) throw new Error("HTTP " + r.status);
-              list = (await r.json())?.value?.list || [];
-              if (list.length) break;
-              throw new Error("empty list");
-            } catch (e) { lastErr = e; }
-          }
-          if (!list.length) { console.error("fetch failed after 3 attempts:", lastErr); process.exit(1); }
+          // 双源取数：① 体彩官方接口（2026-11 起其 WAF 拦截 GitHub 出口 IP，仅作首选尝试）
+          //          ② 500彩票网历史页兜底（GitHub 可直连，实测数据与官方逐期一致）
+          // 校验：号码合法性 + 与仓库快照重叠期交叉核对 + 新期连续无跳期；任何不过即退出，绝不写坏数据。
+          const UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
           const fs = await import("node:fs");
-          const path = "data_snapshot.json";
-          const cur = JSON.parse(fs.readFileSync(path, "utf8"));
-          const maxOld = cur.draws[0][0];
-          const fresh = [];
-          for(const x of list){
-            const i = parseInt(x.lotteryDrawNum, 10);
-            if(i <= maxOld) continue;
-            const n = (x.lotteryDrawResult || "").trim().split(/\s+/).map(Number);
-            if(n.length !== 7) continue;
-            const f = n.slice(0,5).sort((a,b)=>a-b), b = n.slice(5).sort((a,b)=>a-b);
-            const okf = new Set(f).size===5 && f.every(v=>v>=1&&v<=35);
-            const okb = new Set(b).size===2 && b.every(v=>v>=1&&v<=12);
-            if(!okf || !okb){ console.error("bad draw", i); process.exit(1); }
-            fresh.push([i, x.lotteryDrawTime.slice(0,10), f, b]);
+          const OFFICIAL = "https://webapi.sporttery.cn/gateway/lottery/getHistoryPageListV1.qry?gameNo=85&provinceId=0&pageSize=30&isVerify=1&pageNo=1";
+          const MIRROR = "https://datachart.500.com/dlt/history/inc/history.php?limit=30";
+          const HO = { "User-Agent": UA, "Accept": "application/json, text/plain, */*", "Referer": "https://static.sporttery.cn/", "Origin": "https://static.sporttery.cn" };
+          const HM = { "User-Agent": UA, "Accept": "*/*", "Referer": "https://datachart.500.com/dlt/history/history.shtml" };
+          async function get(url, headers) {
+            let lastErr;
+            for (let a = 1; a <= 2; a++) {
+              try {
+                const r = await fetch(url, { headers });
+                if (!r.ok) throw new Error("HTTP " + r.status);
+                return await r.text();
+              } catch (e) { lastErr = e; }
+            }
+            throw lastErr;
           }
-          if(!fresh.length){ console.log("already up to date at", maxOld); process.exit(0); }
-          fresh.sort((a,b)=>b[0]-a[0]);
+          let draws = [];
+          try {
+            const j = JSON.parse(await get(OFFICIAL, HO));
+            for (const x of j?.value?.list || []) {
+              const n = (x.lotteryDrawResult || "").trim().split(/\s+/).map(Number);
+              if (n.length !== 7) continue;
+              draws.push([parseInt(x.lotteryDrawNum, 10), String(x.lotteryDrawTime).slice(0, 10),
+                n.slice(0, 5).sort((a, b) => a - b), n.slice(5).sort((a, b) => a - b)]);
+            }
+            console.log("source=official rows=" + draws.length);
+          } catch (e) { console.log("source=official failed:", e.message); }
+          if (!draws.length) {
+            const html = (await get(MIRROR, HM)).replace(/<!--[\s\S]*?-->/g, "");
+            const rows = html.match(/<tr[^>]*class="t_tr1"[\s\S]*?<\/tr>/gi) || [];
+            for (const tr of rows) {
+              const tds = (tr.match(/<td[^>]*>([\s\S]*?)<\/td>/gi) || []).map(x => x.replace(/<[^>]*>/g, "").trim());
+              const issue = tds.find(v => /^\d{5}$/.test(v));
+              const date = tds.find(v => /^\d{4}-\d{2}-\d{2}$/.test(v));
+              if (!issue || !date) continue;
+              const k = tds.indexOf(issue);
+              const f = tds.slice(k + 1, k + 6).map(Number).sort((a, b) => a - b);
+              const b = tds.slice(k + 6, k + 8).map(Number).sort((a, b) => a - b);
+              const okF = f.length === 5 && new Set(f).size === 5 && f.every(v => v >= 1 && v <= 35);
+              const okB = b.length === 2 && new Set(b).size === 2 && b.every(v => v >= 1 && v <= 12);
+              if (okF && okB) draws.push([parseInt(issue, 10), date, f, b]);
+            }
+            console.log("source=500mirror rows=" + draws.length);
+          }
+          if (!draws.length) { console.error("both sources failed"); process.exit(1); }
+          const cur = JSON.parse(fs.readFileSync("data_snapshot.json", "utf8"));
+          const maxOld = cur.draws[0][0];
+          // 交叉核对：与本地快照重叠的期号，号码与日期必须完全一致
+          for (const d of draws) {
+            const old = cur.draws.find(t => t[0] === d[0]);
+            if (old && (old[1] !== d[1] || JSON.stringify(old[2]) !== JSON.stringify(d[2]) || JSON.stringify(old[3]) !== JSON.stringify(d[3]))) {
+              console.error("cross-check mismatch at draw", d[0]); process.exit(1);
+            }
+          }
+          const fresh = draws.filter(d => d[0] > maxOld).sort((a, b) => b[0] - a[0]);
+          // 连续性：新期必须从 maxOld+1 连续递增，不允许跳期
+          for (let k = 0; k < fresh.length; k++) {
+            if (fresh[k][0] !== maxOld + fresh.length - k) { console.error("gap detected near", fresh[k][0]); process.exit(1); }
+          }
+          if (!fresh.length) { console.log("already up to date at", maxOld); process.exit(0); }
           cur.draws = [...fresh, ...cur.draws];
           cur.total = cur.draws.length;
           cur.updated = cur.draws[0][1];
-          fs.writeFileSync(path, JSON.stringify(cur));
+          fs.writeFileSync("data_snapshot.json", JSON.stringify(cur));
           console.log("added", fresh.length, "draw(s); latest =", cur.draws[0][0]);
           EOF
           node update.mjs
