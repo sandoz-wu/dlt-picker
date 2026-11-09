@@ -17,10 +17,25 @@ jobs:
       - name: Fetch latest draws
         run: |
           cat > update.mjs <<'EOF'
-          const r = await fetch("https://webapi.sporttery.cn/gateway/lottery/getHistoryPageListV1.qry?gameNo=85&provinceId=0&pageSize=30&isVerify=1&pageNo=1");
-          const j = await r.json();
-          const list = j?.value?.list || [];
-          if(!list.length){ console.error("no data"); process.exit(1); }
+          const API = "https://webapi.sporttery.cn/gateway/lottery/getHistoryPageListV1.qry?gameNo=85&provinceId=0&pageSize=30&isVerify=1&pageNo=1";
+          // 2026-11-07 起官方接口 WAF 拦截无浏览器头的请求（实测 HTTP 567），必须带 UA/Referer
+          const HEADERS = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+            "Accept": "application/json, text/plain, */*",
+            "Referer": "https://static.sporttery.cn/",
+            "Origin": "https://static.sporttery.cn",
+          };
+          let list = [], lastErr = null;
+          for (let a = 1; a <= 3; a++) {
+            try {
+              const r = await fetch(API, { headers: HEADERS });
+              if (!r.ok) throw new Error("HTTP " + r.status);
+              list = (await r.json())?.value?.list || [];
+              if (list.length) break;
+              throw new Error("empty list");
+            } catch (e) { lastErr = e; }
+          }
+          if (!list.length) { console.error("fetch failed after 3 attempts:", lastErr); process.exit(1); }
           const fs = await import("node:fs");
           const path = "data_snapshot.json";
           const cur = JSON.parse(fs.readFileSync(path, "utf8"));
