@@ -88,11 +88,64 @@ jobs:
           console.log("added", fresh.length, "draw(s); latest =", cur.draws[0][0]);
           EOF
           node update.mjs
+      - name: Fetch kl8 draws (快乐8)
+        run: |
+          cat > update_kl8.mjs <<'EOF'
+          // 快乐8：从 17500 静态镜像取全史，重播种 index.html 的 RAW_KL8 行（最近300期）
+          const UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
+          const fs = await import("node:fs");
+          let txt, lastErr;
+          for (let a = 1; a <= 2; a++) {
+            try {
+              const r = await fetch("https://data.17500.cn/kl8_asc.txt", { headers: { "User-Agent": UA, "Referer": "https://www.17500.cn/" } });
+              if (!r.ok) throw new Error("HTTP " + r.status);
+              txt = await r.text();
+              if (txt.length > 100000) break;
+              throw new Error("内容过短");
+            } catch (e) { lastErr = e; }
+          }
+          if (!txt || txt.length <= 100000) { console.error("kl8 fetch failed:", lastErr); process.exit(1); }
+          function parseLine(l) {
+            const p = l.trim().split(/\s+/);
+            if (!/^\d{7}$/.test(p[0]) || !/^\d{4}-\d{2}-\d{2}$/.test(p[1])) return null;
+            const n = p.slice(2, 22).map(Number);
+            const ok = n.length === 20 && new Set(n).size === 20 && n.every((v) => v >= 1 && v <= 80) && n.every((v, i) => i === 0 || v > n[i - 1]);
+            return ok ? [parseInt(p[0], 10), p[1], n] : null;
+          }
+          const all = txt.trim().split("\n").map(parseLine).filter(Boolean);
+          if (all.length < 100) { console.error("kl8 parse failed"); process.exit(1); }
+          let html = fs.readFileSync("index.html", "utf8");
+          const m = html.match(/const RAW_KL8 = (\{[\s\S]*?\});/);
+          let localMax = 0;
+          if (m) localMax = JSON.parse(m[1]).draws[0][0];
+          const apiMax = all[all.length - 1][0];
+          if (apiMax <= localMax) { console.log("kl8 already up to date at", localMax); process.exit(0); }
+          const fresh = all.filter((d) => d[0] > localMax);
+          if (fresh.length > 31) { console.error("kl8 too many fresh draws:", fresh.length); process.exit(1); }
+          if (m) {
+            const cur = JSON.parse(m[1]);
+            for (const d of all) {
+              const old = cur.draws.find((t) => t[0] === d[0]);
+              if (old && (old[1] !== d[1] || JSON.stringify(old[2]) !== JSON.stringify(d[2]))) { console.error("kl8 cross-check mismatch at", d[0]); process.exit(1); }
+            }
+          }
+          const snap300 = all.slice(-300).sort((a, b) => b[0] - a[0]);
+          const snap = { game: "kl8", updated: snap300[0][1], total: 300, draws: snap300 };
+          const line = "const RAW_KL8 = " + JSON.stringify(snap) + ";";
+          if (m) html = html.replace(m[0], line);
+          else {
+            const i = html.indexOf("\n", html.indexOf("const RAW_DRAWS"));
+            html = html.slice(0, i + 1) + line + "\n" + html.slice(i + 1);
+          }
+          fs.writeFileSync("index.html", html);
+          console.log("kl8: added", fresh.length, "draw(s); latest =", snap300[0][0]);
+          EOF
+          node update_kl8.mjs
       - name: Commit & push
         run: |
           git config user.name "data-bot"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add data_snapshot.json
+          git add data_snapshot.json index.html
           if git diff --cached --quiet; then
             echo "no change"
           else
